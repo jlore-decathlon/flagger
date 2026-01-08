@@ -17,36 +17,23 @@ limitations under the License.
 package providers
 
 import (
-	"context"
-	"crypto/tls"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"net/url"
-	"os"
+	"strings"
 	"time"
-
+	
+	rest "k8s.io/client-go/rest"
 	flaggerv1 "github.com/fluxcd/flagger/pkg/apis/flagger/v1beta1"
-	"k8s.io/metrics/pkg/apis/external_metrics"
-)
-
-const (
-	metricServiceEndpointPath = "/apis/external.metrics.k8s.io/v1beta1"
-	namespacesPath            = "/namespaces/"
-
-	authorizationHeaderKey = "Authorization"
-	applicationBearerToken = "token"
+	externalmetrics_client "k8s.io/metrics/pkg/client/external_metrics"
+	labels "k8s.io/apimachinery/pkg/labels"
 )
 
 // ExternalMetricsProvider fetches metrics from an ExternalMetricsProvider.
 type ExternalMetricsProvider struct {
 	metricServiceEndpoint string
-	bearerToken           string
 
 	timeout time.Duration
-	client  *http.Client
+	client  *externalmetrics_client.ExternalMetricsClient
 }
 
 // NewExternalMetricsProvider takes a canary spec, a provider spec, and
@@ -58,32 +45,23 @@ func NewExternalMetricsProvider(metricInterval string,
 	if provider.Address == "" {
 		return nil, fmt.Errorf("the Url of the external metric service must be provided")
 	}
+	
+	client, err := externalmetrics_client.NewForConfig(
+		&rest.Config{
+			Host: provider.Address,
+			TLSClientConfig: rest.TLSClientConfig{
+				Insecure: provider.InsecureSkipVerify,
+			},
+		},
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("error creating external metric client: %w", err)
+	}
 
 	emp := ExternalMetricsProvider{
-		metricServiceEndpoint: fmt.Sprintf("%s%s", provider.Address, metricServiceEndpointPath),
 		timeout:               5 * time.Second,
-		client:                http.DefaultClient,
-	}
-
-	if provider.InsecureSkipVerify {
-		t := http.DefaultTransport.(*http.Transport).Clone()
-		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		emp.client = &http.Client{Transport: t}
-	}
-
-	if b, ok := credentials[applicationBearerToken]; ok {
-		emp.bearerToken = string(b)
-	} else {
-		// In the absence of a provided token, 
-		// read service account token from volume mount
-		token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-		if err != nil {
-			return nil, fmt.Errorf("error reading service account token: %w", err)
-		}
-		if len(token) == 0 {
-			return nil, fmt.Errorf("pod's service account token is empty")
-		}
-		emp.bearerToken = string(token)
+		client:                &client,
 	}
 
 	return &emp, nil
@@ -92,64 +70,65 @@ func NewExternalMetricsProvider(metricInterval string,
 // RunQuery retrieves the ExternalMetricValue from the ExternalMetricsProvider.metricServiceUrl
 // and returns the first result as a float64
 func (p *ExternalMetricsProvider) RunQuery(query string) (float64, error) {
-	u := fmt.Sprintf("%s%s%s", p.metricServiceEndpoint, namespacesPath, query)
-
-	req, err := http.NewRequest("GET", u, nil)
+	// The Provider interface only allows a plain string query so decode it
+	namespace, metricName, selector, err := parseExternalMetricsQuery(query)
 	if err != nil {
-		return 0, fmt.Errorf("error http.NewRequest: %w", err)
-	}
-	if p.bearerToken != "" {
-		req.Header.Add(authorizationHeaderKey, fmt.Sprintf("Bearer %s", p.bearerToken))
+		return 0, fmt.Errorf("error parsing metric query: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(req.Context(), p.timeout)
-	defer cancel()
-	r, err := p.client.Do(req.WithContext(ctx))
+	// Read metrics from external metrics API
+	nm := (*p.client).NamespacedMetrics(namespace)
+	s, err := labels.Parse(selector)
 	if err != nil {
-		return 0, fmt.Errorf("request failed: %w", err)
+		return 0, fmt.Errorf("error parsing label selector: %w", err)
 	}
 
-	defer r.Body.Close()
-	b, err := io.ReadAll(r.Body)
-	if err != nil {
-		return 0, fmt.Errorf("error reading body: %w", err)
+	metricsList, err := nm.List(metricName,s)
+	if len(metricsList.Items) < 1 {
+		return 0, fmt.Errorf("No external metrics found: %w", ErrNoValuesFound)
 	}
 
-	if r.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("error response: %s: %w", string(b), err)
-	}
-
-	var res external_metrics.ExternalMetricValueList
-	if err := json.Unmarshal(b, &res); err != nil {
-		return 0, fmt.Errorf("error unmarshaling result: %w, '%s'", err, string(b))
-	}
-
-	if len(res.Items) < 1 {
-		return 0, fmt.Errorf("invalid response: %s: %w", string(b), ErrNoValuesFound)
-	}
-
-	vs := res.Items[0].Value.AsApproximateFloat64()
+	// We accept to ignore extra metrics if more that one matches
+	vs := metricsList.Items[0].Value.AsApproximateFloat64()
 
 	return vs, nil
 }
 
-// IsOnline will only check the TCP endpoint reachability,
-// given that external metric servers don't have a standard health check endpoint defined
+// IsOnline tests that the External metric API is reachable by looking for dummy metrics
+// If we don't get a network error, we assume the service is online
 func (p *ExternalMetricsProvider) IsOnline() (bool, error) {
-	var d net.Dialer
+    nm := (*p.client).NamespacedMetrics("kube-system")
+    _, err := nm.List("dummy-metric", labels.Everything())
+    
+    if err != nil {
+        return false, fmt.Errorf("external metrics service unavailable: %w", err)
+    }
+    return true, nil
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
-	defer cancel()
-
-	u, err := url.Parse(p.metricServiceEndpoint)
-	if err != nil {
-		return false, fmt.Errorf("error parsing metric service url: %w", err)
-	}
-
-	conn, err := d.DialContext(ctx, "tcp", u.Host)
-	defer conn.Close()
-	if err != nil {
-		return false, fmt.Errorf("connection failed: %w", err)
-	}
-	return true, err
+func parseExternalMetricsQuery(query string) (namespace, metricName, labelSelector string, err error) {
+    parts := strings.SplitN(query, "?", 2)
+    pathPart := parts[0]
+    
+    if len(parts) > 1 {
+        queryParams, err := url.ParseQuery(parts[1])
+        if err != nil {
+            return "", "", "", fmt.Errorf("error parsing query parameters: %w", err)
+        }
+        labelSelector = queryParams.Get("labelSelector")
+    }
+    
+    pathSegments := strings.SplitN(pathPart, "/", 2)
+    if len(pathSegments) != 2 {
+        return "", "", "", fmt.Errorf("invalid query format: expected <namespace>/<metricName>, got %s", pathPart)
+    }
+    
+    namespace = pathSegments[0]
+    metricName = pathSegments[1]
+    
+    if namespace == "" || metricName == "" {
+        return "", "", "", fmt.Errorf("namespace and metricName cannot be empty")
+    }
+    
+    return namespace, metricName, labelSelector, nil
 }
