@@ -83,7 +83,7 @@ func (p *ExternalMetricsProvider) RunQuery(query string) (float64, error) {
 		return 0, fmt.Errorf("error parsing label selector: %w", err)
 	}
 
-	metricsList, err := nm.List(metricName,s)
+	metricsList, err := nm.List(metricName, s)
 	if len(metricsList.Items) < 1 {
 		return 0, fmt.Errorf("No external metrics found: %w", ErrNoValuesFound)
 	}
