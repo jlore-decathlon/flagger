@@ -88,7 +88,7 @@ func (p *ExternalMetricsProvider) RunQuery(query string) (float64, error) {
 		return 0, fmt.Errorf("no external metrics found: %w", ErrNoValuesFound)
 	}
 
-	// We accept to ignore extra metrics if more that one matches
+	// We accept to ignore extra metrics if more than one matches
 	vs := metricsList.Items[0].Value.AsApproximateFloat64()
 
 	return vs, nil
