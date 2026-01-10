@@ -85,7 +85,7 @@ func (p *ExternalMetricsProvider) RunQuery(query string) (float64, error) {
 
 	metricsList, err := nm.List(metricName, s)
 	if len(metricsList.Items) < 1 {
-		return 0, fmt.Errorf("No external metrics found: %w", ErrNoValuesFound)
+		return 0, fmt.Errorf("no external metrics found: %w", ErrNoValuesFound)
 	}
 
 	// We accept to ignore extra metrics if more that one matches
