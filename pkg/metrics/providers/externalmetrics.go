@@ -21,50 +21,57 @@ import (
 	"net/url"
 	"strings"
 	"time"
-	
-	rest "k8s.io/client-go/rest"
+
 	flaggerv1 "github.com/fluxcd/flagger/pkg/apis/flagger/v1beta1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/rest"
 	externalmetrics_client "k8s.io/metrics/pkg/client/external_metrics"
-	labels "k8s.io/apimachinery/pkg/labels"
 )
 
 // ExternalMetricsProvider fetches metrics from an ExternalMetricsProvider.
 type ExternalMetricsProvider struct {
-	metricServiceEndpoint string
-
 	timeout time.Duration
-	client  *externalmetrics_client.ExternalMetricsClient
+	client  externalmetrics_client.NamespacedMetricsGetter
 }
 
 // NewExternalMetricsProvider takes a canary spec, a provider spec, and
 // returns a client ready to execute queries against the Service
+// Note : interval is ignored because not available in External Metrics API
 func NewExternalMetricsProvider(metricInterval string,
 	provider flaggerv1.MetricTemplateProvider,
 	credentials map[string][]byte) (*ExternalMetricsProvider, error) {
 
+	var restConfig *rest.Config
 	if provider.Address == "" {
-		return nil, fmt.Errorf("the Url of the external metric service must be provided")
-	}
-	
-	client, err := externalmetrics_client.NewForConfig(
-		&rest.Config{
+		restConfig, err := rest.InClusterConfig()
+		if err != nil && err != rest.ErrNotInCluster {
+			return nil, fmt.Errorf("no provider address given and not in a kubernetes cluster: %w", err)
+		}
+		restConfig.Insecure = provider.InsecureSkipVerify
+		// TODO: do we allow overriding credentials if detected in cluster ?
+	} else {
+		// Not detected in cluster, need to build the config
+		restConfig = &rest.Config{
 			Host: provider.Address,
 			TLSClientConfig: rest.TLSClientConfig{
 				Insecure: provider.InsecureSkipVerify,
 			},
-		},
-	)
+		}
+		if tokenBytes, ok := credentials["token"]; ok {
+			restConfig.BearerToken = string(tokenBytes)
+		}
+		// TODO: handle username/password auth if needed
+	}
 
+	client, err := externalmetrics_client.NewForConfig(restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("error creating external metric client: %w", err)
 	}
 
-	emp := ExternalMetricsProvider{
-		timeout:               5 * time.Second,
-		client:                &client,
-	}
-
-	return &emp, nil
+	return &ExternalMetricsProvider{
+		timeout: 5 * time.Second,
+		client:  client,
+	}, nil
 }
 
 // RunQuery retrieves the ExternalMetricValue from the ExternalMetricsProvider.metricServiceUrl
@@ -77,13 +84,12 @@ func (p *ExternalMetricsProvider) RunQuery(query string) (float64, error) {
 	}
 
 	// Read metrics from external metrics API
-	nm := (*p.client).NamespacedMetrics(namespace)
-	s, err := labels.Parse(selector)
+	nm := p.client.NamespacedMetrics(namespace)
+	metricsList, err := nm.List(metricName, selector)
 	if err != nil {
-		return 0, fmt.Errorf("error parsing label selector: %w", err)
+		return 0, fmt.Errorf("error querying external metrics API: %w", err)
 	}
 
-	metricsList, err := nm.List(metricName, s)
 	if len(metricsList.Items) < 1 {
 		return 0, fmt.Errorf("no external metrics found: %w", ErrNoValuesFound)
 	}
@@ -97,38 +103,53 @@ func (p *ExternalMetricsProvider) RunQuery(query string) (float64, error) {
 // IsOnline tests that the External metric API is reachable by looking for dummy metrics
 // If we don't get a network error, we assume the service is online
 func (p *ExternalMetricsProvider) IsOnline() (bool, error) {
-    nm := (*p.client).NamespacedMetrics("kube-system")
-    _, err := nm.List("dummy-metric", labels.Everything())
-    
-    if err != nil {
-        return false, fmt.Errorf("external metrics service unavailable: %w", err)
-    }
-    return true, nil
+	nm := p.client.NamespacedMetrics("kube-system")
+	_, err := nm.List("dummy-metric", labels.Everything())
+
+	if err != nil {
+		return false, fmt.Errorf("external metrics service unavailable: %w", err)
+	}
+	return true, nil
 }
 
-func parseExternalMetricsQuery(query string) (namespace, metricName, labelSelector string, err error) {
-    parts := strings.SplitN(query, "?", 2)
-    pathPart := parts[0]
-    
-    if len(parts) > 1 {
-        queryParams, err := url.ParseQuery(parts[1])
-        if err != nil {
-            return "", "", "", fmt.Errorf("error parsing query parameters: %w", err)
-        }
-        labelSelector = queryParams.Get("labelSelector")
-    }
-    
-    pathSegments := strings.SplitN(pathPart, "/", 2)
-    if len(pathSegments) != 2 {
-        return "", "", "", fmt.Errorf("invalid query format: expected <namespace>/<metricName>, got %s", pathPart)
-    }
-    
-    namespace = pathSegments[0]
-    metricName = pathSegments[1]
-    
-    if namespace == "" || metricName == "" {
-        return "", "", "", fmt.Errorf("namespace and metricName cannot be empty")
-    }
-    
-    return namespace, metricName, labelSelector, nil
+func parseExternalMetricsQuery(query string) (namespace string, metricName string, labelSelector labels.Selector, err error) {
+	u, err := url.Parse("dummy:///" + query)
+	if err != nil {
+		return "", "", labels.Everything(), fmt.Errorf("malformed query string, expected <namespace>/<metricName>?labelSelector=<urlencoded label selectors>, got %s", query)
+	}
+	path := strings.TrimPrefix(u.Path, "/")
+	parts := strings.Split(path, "/")
+	if len(parts) > 2 {
+		return "", "", labels.Everything(), fmt.Errorf("malformed query string, too many slashes, expected <namespace>/<metricName>?labelSelector=<urlencoded label selectors>, got %s", query)
+	}
+	
+	namespace = "default"
+	switch len(parts) {
+	case 1:
+		// Format: "metric"
+		metricName = parts[0]
+	case 2:
+		// Format: "namespace/metric" or "/metric"
+		if parts[0] != "" {
+			namespace = parts[0]
+		}
+		metricName = parts[1]
+	}
+	if metricName == "" {
+		return "", "", labels.Everything(), fmt.Errorf("metric name cannot be empty")
+	}
+	// Parse query parameters (e.g. ?labelSelector=...) from the original URL
+	qp := u.Query()
+	rawLs := qp.Get("labelSelector")
+
+	if rawLs == "" {
+		labelSelector = labels.Everything()
+	} else {
+		labelSelector, err = labels.Parse(rawLs)
+		if err != nil {
+			return "", "", labels.Everything(), fmt.Errorf("error parsing label selector from string %s: %w", rawLs, err)
+		}
+	}
+
+	return namespace, metricName, labelSelector, nil
 }
