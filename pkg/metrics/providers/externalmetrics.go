@@ -35,16 +35,28 @@ type ExternalMetricsProvider struct {
 }
 
 // NewExternalMetricsProvider takes a canary spec, a provider spec, and
-// returns a client ready to execute queries against the Service
-// Note : interval is ignored because not available in External Metrics API
+// returns a client ready to execute queries against the Service.
+// Note: Interval is ignored because it is not available in the External Metrics API.
 func NewExternalMetricsProvider(metricInterval string,
 	provider flaggerv1.MetricTemplateProvider,
 	credentials map[string][]byte) (*ExternalMetricsProvider, error) {
+	return newExternalMetricsProviderWithBuilder(
+		metricInterval, provider, credentials, rest.InClusterConfig,
+	)
+}
 
+// newExternalMetricsProviderWithBuilder is like NewExternalMetricsProvider but
+// accepts a rest.Config builder function. Used for testing as InClusterConfig is hard to mock
+func newExternalMetricsProviderWithBuilder(metricInterval string,
+	provider flaggerv1.MetricTemplateProvider,
+	credentials map[string][]byte,
+	configBuilder func() (*rest.Config, error),
+) (*ExternalMetricsProvider, error) {
 	var restConfig *rest.Config
 	if provider.Address == "" {
-		restConfig, err := rest.InClusterConfig()
-		if err != nil && err != rest.ErrNotInCluster {
+		var err error
+		restConfig, err = configBuilder()
+		if err != nil {
 			return nil, fmt.Errorf("no provider address given and not in a kubernetes cluster: %w", err)
 		}
 		restConfig.Insecure = provider.InsecureSkipVerify
@@ -60,7 +72,10 @@ func NewExternalMetricsProvider(metricInterval string,
 		if tokenBytes, ok := credentials["token"]; ok {
 			restConfig.BearerToken = string(tokenBytes)
 		}
-		// TODO: handle username/password auth if needed
+		// TODO: handle user name/password auth if needed
+	}
+	if restConfig == nil {
+		return nil, fmt.Errorf("could not build rest config for external metrics provider")
 	}
 
 	client, err := externalmetrics_client.NewForConfig(restConfig)
@@ -74,8 +89,9 @@ func NewExternalMetricsProvider(metricInterval string,
 	}, nil
 }
 
-// RunQuery retrieves the ExternalMetricValue from the ExternalMetricsProvider.metricServiceUrl
-// and returns the first result as a float64
+// RunQuery retrieves the ExternalMetricValue from the External Metrics API
+// at the ExternalMetricsProvider's Address, using the provided query string,
+// and returns the *first* result as a float64.
 func (p *ExternalMetricsProvider) RunQuery(query string) (float64, error) {
 	// The Provider interface only allows a plain string query so decode it
 	namespace, metricName, selector, err := parseExternalMetricsQuery(query)
@@ -83,7 +99,6 @@ func (p *ExternalMetricsProvider) RunQuery(query string) (float64, error) {
 		return 0, fmt.Errorf("error parsing metric query: %w", err)
 	}
 
-	// Read metrics from external metrics API
 	nm := p.client.NamespacedMetrics(namespace)
 	metricsList, err := nm.List(metricName, selector)
 	if err != nil {
@@ -94,14 +109,13 @@ func (p *ExternalMetricsProvider) RunQuery(query string) (float64, error) {
 		return 0, fmt.Errorf("no external metrics found: %w", ErrNoValuesFound)
 	}
 
-	// We accept to ignore extra metrics if more than one matches
 	vs := metricsList.Items[0].Value.AsApproximateFloat64()
 
 	return vs, nil
 }
 
-// IsOnline tests that the External metric API is reachable by looking for dummy metrics
-// If we don't get a network error, we assume the service is online
+// IsOnline tests that the External Metrics API is reachable by looking for dummy metrics.
+// If we don't get a network error, we assume the service is online.
 func (p *ExternalMetricsProvider) IsOnline() (bool, error) {
 	nm := p.client.NamespacedMetrics("kube-system")
 	_, err := nm.List("dummy-metric", labels.Everything())
@@ -112,6 +126,10 @@ func (p *ExternalMetricsProvider) IsOnline() (bool, error) {
 	return true, nil
 }
 
+// parseExternalMetricsQuery parses a query string in the format:
+//   <namespace>/<metricName>?labelSelector=<urlencoded label selectors>
+// where only the metricName is required.
+// and returns the namespace, metricName, and labelSelector separately.
 func parseExternalMetricsQuery(query string) (namespace string, metricName string, labelSelector labels.Selector, err error) {
 	u, err := url.Parse("dummy:///" + query)
 	if err != nil {
@@ -122,7 +140,7 @@ func parseExternalMetricsQuery(query string) (namespace string, metricName strin
 	if len(parts) > 2 {
 		return "", "", labels.Everything(), fmt.Errorf("malformed query string, too many slashes, expected <namespace>/<metricName>?labelSelector=<urlencoded label selectors>, got %s", query)
 	}
-	
+
 	namespace = "default"
 	switch len(parts) {
 	case 1:
@@ -138,16 +156,15 @@ func parseExternalMetricsQuery(query string) (namespace string, metricName strin
 	if metricName == "" {
 		return "", "", labels.Everything(), fmt.Errorf("metric name cannot be empty")
 	}
-	// Parse query parameters (e.g. ?labelSelector=...) from the original URL
+	
 	qp := u.Query()
-	rawLs := qp.Get("labelSelector")
-
-	if rawLs == "" {
+	rawSelector := qp.Get("labelSelector")
+	if rawSelector == "" {
 		labelSelector = labels.Everything()
 	} else {
-		labelSelector, err = labels.Parse(rawLs)
+		labelSelector, err = labels.Parse(rawSelector)
 		if err != nil {
-			return "", "", labels.Everything(), fmt.Errorf("error parsing label selector from string %s: %w", rawLs, err)
+			return "", "", labels.Everything(), fmt.Errorf("error parsing label selector from string %s: %w", rawSelector, err)
 		}
 	}
 

@@ -17,9 +17,9 @@ limitations under the License.
 package providers
 
 import (
+	"strings"
 	"testing"
 	"time"
-	"strings"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 
 	//fake "k8s.io/client-go/kubernetes/fake"
 
@@ -48,7 +49,7 @@ var (
 	testMetricLabels       = [...]string{"label1"}
 	testMetricLabelsValues = [...]string{"value1"}
 	// 11111e-4 = 1.1111
-	testMetricValue        = resource.NewDecimalQuantity(*inf.NewDec(11111, 4), resource.DecimalSI)
+	testMetricValue = resource.NewDecimalQuantity(*inf.NewDec(11111, 4), resource.DecimalSI)
 )
 
 func TestExternalMetrics_NewProvider(t *testing.T) {
@@ -67,43 +68,91 @@ func TestExternalMetrics_NewProvider(t *testing.T) {
 		assert.Equal(t, 5*time.Second, emp.timeout)
 	})
 	t.Run("In cluster, automatic token", func(t *testing.T) {
-		// TODO: Mock API server / secret file injection ?
+		// Call with empty address to trigger in-cluster path
+		mtp := flaggerv1.MetricTemplateProvider{
+			Address:            "",
+			InsecureSkipVerify: true,
+		}
+		// However testing with rest.InClusterConfig is hard
+		// so we provide a builder func instead
+		c := &rest.Config{
+			Host:            "https://kubernetes.default.svc",
+			BearerToken:     "fake-token",
+			TLSClientConfig: rest.TLSClientConfig{Insecure: true},
+		}
+
+		emp, err := newExternalMetricsProviderWithBuilder(
+			"100s", mtp, map[string][]byte{},
+			func() (*rest.Config, error) { return c, nil },
+		)
+		require.NoError(t, err)
+		assert.NotNil(t, emp)
 	})
 }
 
 func TestExternalMetrics_ParseQuery(t *testing.T) {
-	// TODO: assess relevance of moving these to table-driven tests
-	t.Run("General case", func(t *testing.T) {
-		metricNamespace, metricName, labelSelector, err := parseExternalMetricsQuery(testQuery)
-		require.NoError(t, err)
-		assert.Equal(t, testMetricNamespace, metricNamespace)
-		assert.Equal(t, testMetricName, metricName)
-		assert.Equal(t, labels.Set{testMetricLabels[0]: testMetricLabelsValues[0]}.AsSelector(), labelSelector)
-	})
-	t.Run("OK without labelSelector", func(t *testing.T) {
-		trimmed := testQuery[:strings.Index(testQuery, "?")]
-		metricNamespace, metricName, labelSelector, err := parseExternalMetricsQuery(trimmed)
-		require.NoError(t, err)
-		assert.Equal(t, testMetricNamespace, metricNamespace)
-		assert.Equal(t, testMetricName, metricName)
-		assert.Equal(t, labels.Everything(), labelSelector)
-	})
-	t.Run("Missing metric name", func(t *testing.T) {
-		invalidQueries := []string{
-			"namespaceonly/",
-			"/",
-			"",
-		}
-		for _, iq := range invalidQueries {
-			_, _, _, err := parseExternalMetricsQuery(iq)
-			require.Error(t, err)
-		}
-	})
-	t.Run("No namespace uses default", func(t *testing.T) {
-		ns, _, _, err := parseExternalMetricsQuery("/metric_only")
-		require.NoError(t, err)
-		assert.Equal(t, "default", ns)
-	})
+	tests := []struct {
+		name              string
+		query             string
+		wantNamespace     string
+		wantMetricName    string
+		wantLabelSelector string
+		wantErr           bool
+	}{
+		{
+			name:              "General case",
+			query:             testQuery,
+			wantNamespace:     testMetricNamespace,
+			wantMetricName:    testMetricName,
+			wantLabelSelector: labels.Set{testMetricLabels[0]: testMetricLabelsValues[0]}.AsSelector().String(),
+			wantErr:           false,
+		},
+		{
+			name:              "Still OK without labelSelector",
+			query:             testQuery[:strings.Index(testQuery, "?")],
+			wantNamespace:     testMetricNamespace,
+			wantMetricName:    testMetricName,
+			wantLabelSelector: labels.Everything().String(),
+			wantErr:           false,
+		},
+		{
+			name:              "No namespace uses default",
+			query:             "/metric_only",
+			wantNamespace:     "default",
+			wantMetricName:    "metric_only",
+			wantLabelSelector: labels.Everything().String(),
+			wantErr:           false,
+		},
+		{
+			name:    "Missing metric name - namespaceonly",
+			query:   "namespaceonly/",
+			wantErr: true,
+		},
+		{
+			name:    "Missing metric name - slash only",
+			query:   "/",
+			wantErr: true,
+		},
+		{
+			name:    "Missing metric name - empty",
+			query:   "",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotNamespace, gotMetricName, gotLabelSelector, err := parseExternalMetricsQuery(tt.query)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantNamespace, gotNamespace)
+				assert.Equal(t, tt.wantMetricName, gotMetricName)
+				assert.Equal(t, tt.wantLabelSelector, gotLabelSelector.String())
+			}
+		})
+	}
 }
 
 func TestExternalMetrics_RunQuery(t *testing.T) {
