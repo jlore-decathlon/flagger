@@ -52,31 +52,22 @@ func newExternalMetricsProviderWithBuilder(metricInterval string,
 	credentials map[string][]byte,
 	configBuilder func() (*rest.Config, error),
 ) (*ExternalMetricsProvider, error) {
-	var restConfig *rest.Config
-	if provider.Address == "" {
-		var err error
-		restConfig, err = configBuilder()
-		if err != nil {
-			return nil, fmt.Errorf("no provider address given and not in a kubernetes cluster: %w", err)
-		}
-		restConfig.Insecure = provider.InsecureSkipVerify
-		// TODO: do we allow overriding credentials if detected in cluster ?
-	} else {
-		// Not detected in cluster, need to build the config
-		restConfig = &rest.Config{
-			Host: provider.Address,
-			TLSClientConfig: rest.TLSClientConfig{
-				Insecure: provider.InsecureSkipVerify,
-			},
-		}
-		if tokenBytes, ok := credentials["token"]; ok {
-			restConfig.BearerToken = string(tokenBytes)
-		}
-		// TODO: handle user name/password auth if needed
+	restConfig, err := configBuilder()
+	if err != nil || restConfig == nil {
+		return nil, fmt.Errorf("Not in a kubernetes cluster: %w", err)
 	}
-	if restConfig == nil {
-		return nil, fmt.Errorf("could not build rest config for external metrics provider")
+
+	// Handling overrides from MetricTemplateProvider
+	if provider.Address != "" {
+		restConfig.Host = provider.Address
 	}
+	restConfig.TLSClientConfig = rest.TLSClientConfig{
+		Insecure: provider.InsecureSkipVerify,
+	}
+	if tokenBytes, ok := credentials["token"]; ok {
+		restConfig.BearerToken = string(tokenBytes)
+	}
+	// TODO: handle user name/password auth if needed
 
 	client, err := externalmetrics_client.NewForConfig(restConfig)
 	if err != nil {

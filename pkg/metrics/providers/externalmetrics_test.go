@@ -29,8 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 
-	//fake "k8s.io/client-go/kubernetes/fake"
-
 	flaggerv1 "github.com/fluxcd/flagger/pkg/apis/flagger/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stesting "k8s.io/client-go/testing"
@@ -53,41 +51,56 @@ var (
 )
 
 func TestExternalMetrics_NewProvider(t *testing.T) {
-	t.Run("Custom token", func(t *testing.T) {
-		mtp := flaggerv1.MetricTemplateProvider{
+	tests := []struct {
+		name               string
+		Address            string
+		InsecureSkipVerify bool
+		creds              map[string][]byte
+		builderFunc        func() (*rest.Config, error)
+		wantErr            bool
+	}{
+		{
+			name:               "Custom provider address and token",
 			Address:            testMetricServerAddress,
 			InsecureSkipVerify: false,
-		}
-		creds := map[string][]byte{
-			"token": []byte("test-token"),
-		}
-
-		// Should be OK
-		emp, err := NewExternalMetricsProvider("100s", mtp, creds)
-		require.NoError(t, err)
-		assert.Equal(t, 5*time.Second, emp.timeout)
-	})
-	t.Run("In cluster, automatic token", func(t *testing.T) {
-		// Call with empty address to trigger in-cluster path
-		mtp := flaggerv1.MetricTemplateProvider{
+			creds: map[string][]byte{
+				"token": []byte("test-token"),
+			},
+			builderFunc: func() (*rest.Config, error) { return &rest.Config{}, nil },
+			wantErr:     false,
+		},
+		{
+			name:               "In cluster, automatic address and token",
 			Address:            "",
 			InsecureSkipVerify: true,
-		}
-		// However testing with rest.InClusterConfig is hard
-		// so we provide a builder func instead
-		c := &rest.Config{
-			Host:            "https://kubernetes.default.svc",
-			BearerToken:     "fake-token",
-			TLSClientConfig: rest.TLSClientConfig{Insecure: true},
-		}
+			creds:              map[string][]byte{},
+			builderFunc: func() (*rest.Config, error) {
+				return &rest.Config{
+					Host:            "https://kubernetes.default.svc",
+					BearerToken:     "fake-token",
+					TLSClientConfig: rest.TLSClientConfig{Insecure: true},
+				}, nil
+			},
+			wantErr: false,
+		},
+	}
 
-		emp, err := newExternalMetricsProviderWithBuilder(
-			"100s", mtp, map[string][]byte{},
-			func() (*rest.Config, error) { return c, nil },
-		)
-		require.NoError(t, err)
-		assert.NotNil(t, emp)
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mtp := flaggerv1.MetricTemplateProvider{
+				Address:            tt.Address,
+				InsecureSkipVerify: tt.InsecureSkipVerify,
+			}
+			emp, err := newExternalMetricsProviderWithBuilder("100s", mtp, tt.creds, tt.builderFunc)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, emp)
+			assert.Equal(t, 5*time.Second, emp.timeout)
+		})
+	}
 }
 
 func TestExternalMetrics_ParseQuery(t *testing.T) {
