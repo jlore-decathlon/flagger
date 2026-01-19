@@ -36,18 +36,17 @@ type ExternalMetricsProvider struct {
 
 // NewExternalMetricsProvider takes a canary spec, a provider spec, and
 // returns a client ready to execute queries against the Service.
-// Note: Interval is ignored because it is not available in the External Metrics API.
-func NewExternalMetricsProvider(metricInterval string,
+func NewExternalMetricsProvider(
 	provider flaggerv1.MetricTemplateProvider,
 	credentials map[string][]byte) (*ExternalMetricsProvider, error) {
 	return newExternalMetricsProviderWithBuilder(
-		metricInterval, provider, credentials, rest.InClusterConfig,
+		provider, credentials, rest.InClusterConfig,
 	)
 }
 
 // newExternalMetricsProviderWithBuilder is like NewExternalMetricsProvider but
 // accepts a rest.Config builder function. Used for testing as InClusterConfig is hard to mock
-func newExternalMetricsProviderWithBuilder(metricInterval string,
+func newExternalMetricsProviderWithBuilder(
 	provider flaggerv1.MetricTemplateProvider,
 	credentials map[string][]byte,
 	configBuilder func() (*rest.Config, error),
